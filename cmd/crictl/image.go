@@ -19,14 +19,17 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
 	"github.com/docker/go-units"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
+	decor "github.com/vbauerster/mpb/v8/decor"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
+	mpb "github.com/vbauerster/mpb/v8"
 )
 
 type imageByRef []*pb.Image
@@ -108,6 +111,76 @@ var pullImageCommand = &cli.Command{
 			return fmt.Errorf("pulling image: %w", err)
 		}
 		fmt.Printf("Image is up to date for %s\n", r.ImageRef)
+		return nil
+	},
+}
+
+var pullImageWithProgressCommand = &cli.Command{
+	Name:                   "pulls",
+	Usage:                  "Pull an image from a registry with progress updates",
+	UseShortOptionHandling: true,
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:    "creds",
+			Value:   "",
+			Usage:   "Use `USERNAME[:PASSWORD]` for accessing the registry",
+			EnvVars: []string{"CRICTL_CREDS"},
+		},
+		&cli.StringFlag{
+			Name:    "auth",
+			Value:   "",
+			Usage:   "Use `AUTH_STRING` for accessing the registry. AUTH_STRING is a base64 encoded 'USERNAME[:PASSWORD]'",
+			EnvVars: []string{"CRICTL_AUTH"},
+		},
+		&cli.StringFlag{
+			Name:      "pod-config",
+			Value:     "",
+			Usage:     "Use `pod-config.[json|yaml]` to override the the pull context",
+			TakesFile: true,
+		},
+		&cli.StringSliceFlag{
+			Name:    "annotation",
+			Aliases: []string{"a"},
+			Usage:   "Annotation to be set on the pulled image",
+		},
+	},
+	ArgsUsage: "NAME[:TAG|@DIGEST]",
+	Action: func(context *cli.Context) error {
+		imageName := context.Args().First()
+		if imageName == "" {
+			return cli.ShowSubcommandHelp(context)
+		}
+
+		imageClient, err := getImageService(context)
+		if err != nil {
+			return err
+		}
+
+		auth, err := getAuth(context.String("creds"), context.String("auth"))
+		if err != nil {
+			return err
+		}
+		var sandbox *pb.PodSandboxConfig
+		if context.IsSet("pod-config") {
+			sandbox, err = loadPodSandboxConfig(context.String("pod-config"))
+			if err != nil {
+				return fmt.Errorf("load podSandboxConfig: %w", err)
+			}
+		}
+		var ann map[string]string
+		if context.IsSet("annotation") {
+			annotationFlags := context.StringSlice("annotation")
+			ann, err = parseLabelStringSlice(annotationFlags)
+			if err != nil {
+				return err
+			}
+		}
+
+		r, err := PullImageWithProgress(imageClient, imageName, auth, sandbox, ann)
+		if err != nil {
+			return fmt.Errorf("pulling image: %w", err)
+		}
+		fmt.Printf("Image %s is up to date\n", r)
 		return nil
 	},
 }
@@ -579,6 +652,106 @@ func PullImageWithSandbox(client internalapi.ImageManagerService, image string, 
 	resp := &pb.PullImageResponse{ImageRef: res}
 	logrus.Debugf("PullImageResponse: %v", resp)
 	return resp, nil
+}
+
+type pullInfo struct {
+	bar *mpb.Bar
+	prevOffset uint64
+}
+
+// PullImageWithProgress sends a PullImageWithProgressRequest to the server, and parses
+// the returned PullImageWithProgressResponse with progress bar.
+func PullImageWithProgress(client internalapi.ImageManagerService, image string, auth *pb.AuthConfig, sandbox *pb.PodSandboxConfig, ann map[string]string) (string, error) {
+	var pullInProgress pullInfo
+
+	request := &pb.PullImageWithProgressRequest{
+		Image: &pb.ImageSpec{
+			Image:       image,
+			Annotations: ann,
+		},
+	}
+
+	if auth != nil {
+		request.Auth = auth
+	}
+
+	if sandbox != nil {
+		request.SandboxConfig = sandbox
+	}
+
+	logrus.Debugf("PullImageWithProgressRequest: %v", request)
+
+	stream, cancel, err := client.PullImageWithProgress(request.Image, request.Auth, request.SandboxConfig)
+	if err != nil {
+		return "", err
+	}
+
+	logrus.Debugf("Waiting for data")
+
+	bars := mpb.New(mpb.WithWidth(48))
+	var total uint64
+
+	for {
+		var resp *pb.PullImageWithProgressResponse
+
+		resp, err = stream.Recv()
+		if err != nil {
+			if err != io.EOF {
+				logrus.Debugf("err %v", err)
+			} else {
+				err = nil
+			}
+
+			break
+		}
+
+		if pullInProgress.bar == nil {
+			var bar *mpb.Bar
+
+			total = resp.GetTotal().Value
+
+			if !Debug {
+				bar = bars.AddBar(int64(total),
+					/*
+					mpb.PrependDecorators(
+						decor.Name(name, decor.WC{W: len(name), C: decor.DidentRight}),
+					),
+					*/
+					mpb.AppendDecorators(
+						decor.TotalKibiByte("% .2f", decor.WC{W: 11 + 1, C: decor.DidentRight}),
+						decor.Percentage(decor.WC{W: 6, C: decor.DidentRight}),
+						decor.OnComplete(
+							decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 6, C: decor.DidentRight}), "done",
+						),
+					),
+				)
+			}
+
+			currentAmount := resp.GetOffset().Value
+
+			pullInProgress.bar = bar
+			pullInProgress.prevOffset = currentAmount
+
+			if !Debug {
+				pullInProgress.bar.SetTotal(int64(total), false)
+				pullInProgress.bar.IncrInt64(int64(currentAmount))
+			}
+		} else {
+			currentAmount := resp.GetOffset().Value - pullInProgress.prevOffset
+
+			if !Debug {
+				pullInProgress.bar.IncrInt64(int64(currentAmount))
+			}
+		}
+
+		pullInProgress.prevOffset = resp.GetOffset().Value
+
+		logrus.Debugf("response %v", resp)
+	}
+
+	cancel()
+
+	return image, err
 }
 
 // ListImages sends a ListImagesRequest to the server, and parses

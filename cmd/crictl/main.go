@@ -156,6 +156,7 @@ func main() {
 		runtimePortForwardCommand,
 		listContainersCommand,
 		pullImageCommand,
+		pullImageWithProgressCommand,
 		runContainerCommand,
 		runPodCommand,
 		removeContainerCommand,
